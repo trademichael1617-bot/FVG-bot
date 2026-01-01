@@ -1,6 +1,4 @@
 import asyncio
-import datetime
-import pytz
 import os
 import pandas as pd
 from flask import Flask
@@ -8,7 +6,7 @@ from threading import Thread
 from telegram import Bot
 from pocketoptionapi_async import AsyncPocketOptionClient
 
-# --- KEEP-ALIVE ---
+# --- KEEP-ALIVE SERVER ---
 app = Flask('')
 @app.route('/')
 def home(): return "Bot is Running"
@@ -19,66 +17,54 @@ def run():
 
 Thread(target=run, daemon=True).start()
 
-# --- CONFIG ---
+# --- CONFIGURATION ---
 SSID = os.environ.get("POCKET_SSID")
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 
-PAIRS = [
-    "EURUSD_otc", "AUDCAD_otc", "AUDCHF_otc", "AUDJPY_otc", "AUDNZD_otc", "AUDUSD_otc",
-    "CADCHF_otc", "CADJPY_otc", "CHFJPY_otc", "EURCHF_otc", "EURGBP_otc", "EURJPY_otc",
-    "EURNZD_otc", "GBPAUD_otc", "GBPJPY_otc", "GBPUSD_otc", "NZDJPY_otc", "NZDUSD_otc",
-    "USDCAD_otc", "USDCHF_otc", "USDJPY_otc", "USDRUB_otc", "EURRUB_otc", "CHFNOK_otc",
-    "EURHUF_otc", "USDCNH_otc", "EURTRY_otc", "USDINR_otc", "USDSGD_otc", "USDCLP_otc",
-    "USDMYR_otc", "USDTHB_otc", "USDVND_otc", "USDPKR_otc", "USDCOP_otc", "USDEGP_otc",
-    "USDPHP_otc", "USDMXN_otc", "USDDZD_otc", "USDARS_otc", "USDIDR_otc", "USDBRL_otc",
-    "USDBDT_otc", "YERUSD_otc", "LBPUSD_otc", "TNDUSD_otc", "MADUSD_otc", 
-    "BHDCNY_otc", "AEDCNY_otc", "SARCNY_otc", "QARCNY_otc", "OMRCNY_otc", "JODCNY_otc", 
-    "NGNUSD_otc", "KESUSD_otc", "ZARUSD_otc", "UAHUSD_otc"
-]
-
-last_alerts = {} 
+# Global tracker to prevent duplicate alerts for the same candle
+last_alerts = {}
 
 async def send_tg_alert(bot, msg):
-    try: 
+    """Helper to send Telegram messages safely."""
+    try:
         await bot.send_message(chat_id=CHAT_ID, text=msg)
-        print(f"TG Sent: {msg[:30]}...")
-    except Exception as e: 
-        print(f"TG Fail: {e}")
+        print(f"Telegram Sent: {msg.splitlines()[0]}")
+    except Exception as e:
+        print(f"Telegram Error: {e}")
 
-# --- NEW HEARTBEAT FUNCTION ---
 async def heartbeat_loop(bot, client):
-    """Sends a message every 60 minutes to confirm bot is alive."""
+    """Sends a status update every 60 minutes."""
     while True:
+        await asyncio.sleep(3600)
+        status = "Connected ✅" if client.websocket_client.is_connected else "Disconnected ❌"
         try:
-            await asyncio.sleep(3600) # Wait 1 hour
-            status = "Connected ✅" if client.websocket_client.is_connected else "Disconnected ❌"
-            balance = "N/A"
-            try:
-                bal_data = await client.get_balance()
-                balance = bal_data
-            except: pass
-            
-            await send_tg_alert(bot, f"💓 Bot Heartbeat\nStatus: {status}\nBalance: {balance}\nMonitoring: {len(PAIRS)} pairs")
+            balance = await client.get_balance()
         except:
-            pass
+            balance = "Error fetching"
+        
+        await send_tg_alert(bot, f"💓 Bot Heartbeat\nStatus: {status}\nBalance: {balance}")
 
 def calculate_rsi(series, period=14):
+    """Standard RSI calculation with zero-division protection."""
     delta = series.diff()
     gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
     loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
-    return 100 - (100 / (1 + (gain / (loss + 1e-9))))
+    rs = gain / (loss + 1e-9)
+    return 100 - (100 / (1 + rs))
 
 async def trade_loop(client, asset, bot):
+    """Monitors a specific asset for FVG and RSI signals."""
+    print(f"Started monitoring: {asset}")
     while True:
         try:
             if not client.websocket_client.is_connected:
-                await asyncio.sleep(5)
+                await asyncio.sleep(10)
                 continue
 
             candles = await client.get_candles_dataframe(asset=asset, timeframe=60, count=50)
             if candles is None or candles.empty:
-                await asyncio.sleep(10)
+                await asyncio.sleep(20)
                 continue
 
             candles['rsi'] = calculate_rsi(candles['close'])
@@ -86,47 +72,70 @@ async def trade_loop(client, asset, bot):
             rsi = c3['rsi']
             timestamp = c3.name
 
+            # Check if alert already sent for this candle
             if last_alerts.get(asset) == timestamp:
                 await asyncio.sleep(15)
                 continue
 
             msg = None
+            # Bullish FVG + Oversold RSI
             if c3['low'] > c1['high'] and rsi < 35:
-                msg = f"🚀 BUY: {asset}\nType: CALL 🟢\nRSI: {rsi:.2f}"
+                msg = f"🚀 BUY SIGNAL: {asset}\nType: CALL 🟢\nRSI: {rsi:.2f}\nPayout: 92%"
+            
+            # Bearish FVG + Overbought RSI
             elif c3['high'] < c1['low'] and rsi > 65:
-                msg = f"📉 SELL: {asset}\nType: PUT 🔴\nRSI: {rsi:.2f}"
+                msg = f"📉 SELL SIGNAL: {asset}\nType: PUT 🔴\nRSI: {rsi:.2f}\nPayout: 92%"
 
             if msg:
                 await send_tg_alert(bot, msg)
-                last_alerts[asset] = timestamp 
+                last_alerts[asset] = timestamp
 
-        except: pass
+        except Exception as e:
+            print(f"Loop Error ({asset}): {e}")
+        
         await asyncio.sleep(15)
 
 async def main():
+    if not all([SSID, TELEGRAM_TOKEN, CHAT_ID]):
+        print("❌ Missing environment variables (SSID, TOKEN, or CHAT_ID)")
+        return
+
     bot = Bot(token=TELEGRAM_TOKEN)
+    
     while True:
+        print("🔄 Attempting to connect to Pocket Option...")
         client = AsyncPocketOptionClient(SSID, is_demo=True)
-        try:
-            print("Connecting...")
-            if await client.connect():
-                # Notify immediately on connection
-                await send_tg_alert(bot, "🟢 Bot Connected & Starting Loops...")
-                
-                await asyncio.sleep(3)
-                balance = await client.get_balance()
-                await send_tg_alert(bot, f"✅ Initial Sync Complete\nBalance: {balance}\nPairs: {len(PAIRS)}")
-                
-                # Start trade loops AND heartbeat loop
-                await asyncio.gather(
-                    heartbeat_loop(bot, client),
-                    *[trade_loop(client, p, bot) for p in PAIRS]
-                )
-        except Exception as e:
-            print(f"Connection lost: {e}")
         
-        try: await client.close()
-        except: pass
+        try:
+            if await client.connect():
+                await send_tg_alert(bot, "🟢 Bot Connected. Filtering pairs...")
+                
+                # Discovery logic
+                all_assets = await client.get_all_asset_info()
+                target_pairs = []
+
+                for asset in all_assets:
+                    name = asset[1]
+                    payout = asset[2] # Payout index in current API
+                    
+                    # Filter: Currencies ONLY, OTC ONLY, Payout 92%
+                    is_currency = "#" not in name and "_otc" in name
+                    if is_currency and payout == 92:
+                        target_pairs.append(name)
+
+                balance = await client.get_balance()
+                await send_tg_alert(bot, f"✅ Setup Complete\nBalance: {balance}\nScanning {len(target_pairs)} pairs @ 92% Payout.")
+
+                # Start Heartbeat and all Trade Loops
+                tasks = [heartbeat_loop(bot, client)]
+                for p in target_pairs:
+                    tasks.append(trade_loop(client, p, bot))
+                
+                await asyncio.gather(*tasks)
+        except Exception as e:
+            print(f"Main Loop Error: {e}")
+        
+        print("🔌 Connection lost. Retrying in 30s...")
         await asyncio.sleep(30)
 
 if __name__ == "__main__":
