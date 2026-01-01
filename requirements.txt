@@ -1,1 +1,5 @@
 pocketoptionapi-async
+python-telegram-bot
+pandas
+pytz
+flask
