@@ -1,53 +1,70 @@
 import asyncio
 import datetime
 import pytz
+import os
+from flask import Flask
+from threading import Thread
 from telegram import Bot
 from pocketoptionapi_async import AsyncPocketOptionClient
+
+# --- KEEP-ALIVE SERVER ---
+app = Flask('')
+@app.route('/')
+def home(): return "Bot is Running"
+
+def run():
+    port = int(os.environ.get("PORT", 8080))
+    app.run(host='0.0.0.0', port=port)
+
+Thread(target=run).start()
 
 # --- CONFIGURATION ---
 SSID = "YOUR_SSID"
 TELEGRAM_TOKEN = "YOUR_BOT_TOKEN"
 CHAT_ID = "YOUR_CHAT_ID"
-tg_bot = Bot(token=TELEGRAM_TOKEN)
+
+# Define your 57 OTC pairs here
+PAIRS = ["EURUSD_otc", "GBPUSD_otc", "USDJPY_otc"] # Add all 57 here
 
 # Dual-Block Schedule (UTC)
-MORNING_BLOCK = (8, 12)  # 08:00 - 12:00
-PEAK_BLOCK = (13, 16)    # 13:00 - 16:00
+MORNING_BLOCK = (8, 12)
+PEAK_BLOCK = (13, 16)
 
 def is_trading_session():
     now_utc = datetime.datetime.now(pytz.utc)
-    hour = now_utc.hour
-    in_morning = MORNING_BLOCK[0] <= hour < MORNING_BLOCK[1]
-    in_peak = PEAK_BLOCK[0] <= hour < PEAK_BLOCK[1]
-    return in_morning or in_peak
+    return MORNING_BLOCK[0] <= now_utc.hour < MORNING_BLOCK[1] or \
+           PEAK_BLOCK[0] <= now_utc.hour < PEAK_BLOCK[1]
 
-async def send_tg_alert(msg):
-    await tg_bot.send_message(chat_id=CHAT_ID, text=msg, parse_mode="Markdown")
+async def send_tg_alert(bot, msg):
+    try:
+        await bot.send_message(chat_id=CHAT_ID, text=msg, parse_mode="Markdown")
+    except Exception as e:
+        print(f"Telegram Error: {e}")
 
-async def main():
-    client = AsyncPocketOptionClient(SSID, is_demo=True)
-    await client.connect()
-    
-    # --- DYNAMIC STARTUP ALERT ---
-    current_status = "🟢 ACTIVE" if is_trading_session() else "🟡 STANDBY"
-    startup_msg = (
-        f"🤖 *Pocket Option Bot: {current_status}*\n"
-        f"Sessions (UTC):\n"
-        f"• Morning: 08:00 - 12:00\n"
-        f"• Peak: 13:00 - 16:00\n"
-        f"Assets: 57 OTC Pairs | Payout: 92%"
-    )
-    await send_tg_alert(startup_msg)
-
-    # Monitor all pairs
-    await asyncio.gather(*[trade_loop(client, p) for p in PAIRS])
-
-async def trade_loop(client, asset):
+async def trade_loop(client, asset, bot):
+    print(f"Started monitoring {asset}")
     while True:
         if not is_trading_session():
-            await asyncio.sleep(60) # Check every minute until session opens
+            await asyncio.sleep(60)
             continue
-            
-        # Analysis logic (FVG + RSI + Fractals) goes here...
-        # If signal triggers:
-        # await send_tg_alert(f"🎯 *Signal:* {asset} | CALL | RSI: 32")
+        
+        # FVG/RSI/Fractal Logic would go here
+        await asyncio.sleep(1) 
+
+async def main():
+    bot = Bot(token=TELEGRAM_TOKEN)
+    client = AsyncPocketOptionClient(SSID, is_demo=True)
+    
+    connected = await client.connect()
+    if not connected:
+        print("SSID Failed. Check your connection string.")
+        return
+
+    status = "🟢 ACTIVE" if is_trading_session() else "🟡 STANDBY"
+    await send_tg_alert(bot, f"🤖 *Bot Started*\nStatus: {status}")
+
+    # Start monitoring all pairs
+    await asyncio.gather(*[trade_loop(client, p, bot) for p in PAIRS])
+
+if __name__ == "__main__":
+    asyncio.run(main())
