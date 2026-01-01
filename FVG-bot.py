@@ -21,9 +21,9 @@ Thread(target=run, daemon=True).start()
 
 # --- CONFIGURATION ---
 # Note: Ensure SSID is the full 42["auth",...] string
-SSID = "YOUR_SSID"
-TELEGRAM_TOKEN = "YOUR_BOT_TOKEN"
-CHAT_ID = "YOUR_CHAT_ID"
+SSID = os.environ.get("POCKET_SSID")
+TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
+CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 
 PAIRS = [
     "EURUSD_otc", "AUDCAD_otc", "AUDCHF_otc", "AUDJPY_otc", "AUDNZD_otc", "AUDUSD_otc",
