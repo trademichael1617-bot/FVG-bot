@@ -24,7 +24,6 @@ SSID = os.environ.get("POCKET_SSID")
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 
-# Complete List
 PAIRS = [
     "EURUSD_otc", "AUDCAD_otc", "AUDCHF_otc", "AUDJPY_otc", "AUDNZD_otc", "AUDUSD_otc",
     "CADCHF_otc", "CADJPY_otc", "CHFJPY_otc", "EURCHF_otc", "EURGBP_otc", "EURJPY_otc",
@@ -38,12 +37,31 @@ PAIRS = [
     "NGNUSD_otc", "KESUSD_otc", "ZARUSD_otc", "UAHUSD_otc"
 ]
 
-# Track last alert to prevent spamming the same candle
 last_alerts = {} 
 
 async def send_tg_alert(bot, msg):
-    try: await bot.send_message(chat_id=CHAT_ID, text=msg)
-    except: pass
+    try: 
+        await bot.send_message(chat_id=CHAT_ID, text=msg)
+        print(f"TG Sent: {msg[:30]}...")
+    except Exception as e: 
+        print(f"TG Fail: {e}")
+
+# --- NEW HEARTBEAT FUNCTION ---
+async def heartbeat_loop(bot, client):
+    """Sends a message every 60 minutes to confirm bot is alive."""
+    while True:
+        try:
+            await asyncio.sleep(3600) # Wait 1 hour
+            status = "Connected ✅" if client.websocket_client.is_connected else "Disconnected ❌"
+            balance = "N/A"
+            try:
+                bal_data = await client.get_balance()
+                balance = bal_data
+            except: pass
+            
+            await send_tg_alert(bot, f"💓 Bot Heartbeat\nStatus: {status}\nBalance: {balance}\nMonitoring: {len(PAIRS)} pairs")
+        except:
+            pass
 
 def calculate_rsi(series, period=14):
     delta = series.diff()
@@ -66,11 +84,10 @@ async def trade_loop(client, asset, bot):
             candles['rsi'] = calculate_rsi(candles['close'])
             c1, c3 = candles.iloc[-3], candles.iloc[-1]
             rsi = c3['rsi']
-            timestamp = c3.name # Current candle time
+            timestamp = c3.name
 
-            # Check if we already alerted for this specific candle
             if last_alerts.get(asset) == timestamp:
-                await asyncio.sleep(10)
+                await asyncio.sleep(15)
                 continue
 
             msg = None
@@ -81,24 +98,32 @@ async def trade_loop(client, asset, bot):
 
             if msg:
                 await send_tg_alert(bot, msg)
-                last_alerts[asset] = timestamp # Mark as alerted
+                last_alerts[asset] = timestamp 
 
-        except Exception:
-            pass
-        await asyncio.sleep(15) # Faster scanning for 50+ pairs
+        except: pass
+        await asyncio.sleep(15)
 
 async def main():
     bot = Bot(token=TELEGRAM_TOKEN)
     while True:
         client = AsyncPocketOptionClient(SSID, is_demo=True)
         try:
+            print("Connecting...")
             if await client.connect():
+                # Notify immediately on connection
+                await send_tg_alert(bot, "🟢 Bot Connected & Starting Loops...")
+                
+                await asyncio.sleep(3)
                 balance = await client.get_balance()
-                await send_tg_alert(bot, f"✅ Bot Online\nBalance: {balance}\nMonitoring {len(PAIRS)} pairs.")
-                # Run all loops. If connection drops, this will raise an error and trigger the except block.
-                await asyncio.gather(*[trade_loop(client, p, bot) for p in PAIRS])
+                await send_tg_alert(bot, f"✅ Initial Sync Complete\nBalance: {balance}\nPairs: {len(PAIRS)}")
+                
+                # Start trade loops AND heartbeat loop
+                await asyncio.gather(
+                    heartbeat_loop(bot, client),
+                    *[trade_loop(client, p, bot) for p in PAIRS]
+                )
         except Exception as e:
-            print(f"Connection lost: {e}. Reconnecting...")
+            print(f"Connection lost: {e}")
         
         try: await client.close()
         except: pass
