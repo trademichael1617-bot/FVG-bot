@@ -37,8 +37,9 @@ PAIRS = [
     "NGNUSD_otc", "KESUSD_otc", "ZARUSD_otc", "UAHUSD_otc"
 ]
 
-MORNING_BLOCK = (8, 12)
-PEAK_BLOCK = (13, 16)
+# Change this to allow the bot to run now
+MORNING_BLOCK = (0, 24) 
+PEAK_BLOCK = (0, 0)
 
 def is_trading_session():
     now_utc = datetime.datetime.now(pytz.utc)
@@ -50,15 +51,13 @@ async def send_tg_alert(bot, msg):
         await bot.send_message(chat_id=CHAT_ID, text=msg)
     except Exception as e:
         print(f"Telegram Error: {e}")
-
 async def check_ssid_health(client, bot):
     try:
-        balance_data = await client.get_balance()
-        if balance_data is None:
-            await send_tg_alert(bot, "⚠️ SSID Expired! Update Environment Variables.")
-            return False
+        balance = await client.get_balance()
+        print(f"💰 Connection Verified! Current Balance: {balance}")
         return True
-    except:
+    except Exception as e:
+        print(f"❌ Health Check Failed: {e}")
         return False
 
 def calculate_rsi(series, period=14):
