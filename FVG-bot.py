@@ -95,9 +95,7 @@ async def trade_loop(client, asset, bot):
         except Exception as e:
             print(f"Error analyzing {asset}: {e}")
         await asyncio.sleep(60)
-
 async def main():
-    # 1. Verify ENV Variables
     if not all([SSID, TELEGRAM_TOKEN, CHAT_ID]):
         print("❌ ERROR: Missing Environment Variables!")
         return
@@ -105,6 +103,26 @@ async def main():
     bot = Bot(token=TELEGRAM_TOKEN)
     client = AsyncPocketOptionClient(SSID, is_demo=True)
     
+    print("Connecting to Pocket Option...")
+    # Attempt connection with a few retries
+    connected = False
+    for i in range(3):
+        if await client.connect():
+            connected = True
+            break
+        print(f"Attempt {i+1} failed, retrying...")
+        await asyncio.sleep(5)
+
+    if not connected:
+        print("Initial Connection Failed. Check if SSID is valid/expired.")
+        return
+
+    # Check health after a short delay to let the socket stabilize
+    await asyncio.sleep(2)
+    if not await check_ssid_health(client, bot):
+        return
+
+    # ... rest of your code
     # 2. Connect
     print("Connecting to Pocket Option...")
     if not await client.connect():
