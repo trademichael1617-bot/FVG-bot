@@ -23,8 +23,10 @@ CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 last_alerts = {}
 
 async def send_tg_alert(bot, msg):
-    try: await bot.send_message(chat_id=CHAT_ID, text=msg)
-    except Exception as e: print(f"TG Error: {e}")
+    try: 
+        await bot.send_message(chat_id=CHAT_ID, text=msg)
+    except Exception as e: 
+        print(f"TG Error: {e}")
 
 def calculate_indicators(df):
     # RSI 10
@@ -32,8 +34,12 @@ def calculate_indicators(df):
     gain = (delta.where(delta > 0, 0)).rolling(window=10).mean()
     loss = (-delta.where(delta < 0, 0)).rolling(window=10).mean()
     df['rsi'] = 100 - (100 / (1 + (gain / (loss + 1e-9))))
+    
     # Volume SMA for Surge
     df['vol_avg'] = df['volume'].rolling(window=10).mean()
+    
+    # Support/Resistant zone alignment check (RSI near 50)
+    df['rsi_at_mid'] = (df['rsi'] >= 48) & (df['rsi'] <= 52)
     return df
 
 def find_sr_zones(df, window=30):
@@ -52,24 +58,20 @@ async def check_ssid_health(client, bot):
             await send_tg_alert(bot, "⚠️ SSID EXPIRED: Please refresh your Pocket Option SSID.")
             return False
         return True
-    except Exception as e:
-        if "Authentication timeout" in str(e):
-            await send_tg_alert(bot, "🚨 AUTH ERROR: Invalid/Expired SSID detected.")
+    except Exception:
         return False
 
 async def trade_loop(client, asset, bot):
-    pulse_counter = 0
     while True:
         try:
             df = await client.get_candles_dataframe(asset=asset, timeframe=60, count=250)
             if df is not None and not df.empty:
                 df = calculate_indicators(df)
-                c1, c2, c3 = df.iloc[-3], df.iloc[-2], df.iloc[-1]
+                c1, c3 = df.iloc[-3], df.iloc[-1]
                 rsi_now, rsi_prev = df['rsi'].iloc[-1], df['rsi'].iloc[-2]
                 vol_now, vol_avg = df['volume'].iloc[-1], df['vol_avg'].iloc[-1]
                 current_price, timestamp = c3['close'], df.index[-1]
 
-                # 1. S/R Alignment + Volume
                 sr_levels = find_sr_zones(df, window=30)
                 is_near_sr = any(abs(current_price - level) / current_price < 0.0002 for level in sr_levels)
                 is_vol_surge = vol_now > vol_avg
@@ -78,23 +80,23 @@ async def trade_loop(client, asset, bot):
                     msg = None
                     body = abs(c3['open'] - c3['close'])
 
-                    # BULLISH: FVG 50% + S/R + RSI 50 Cross Up + Rejection
+                    # BULLISH: FVG 50% + S/R + RSI 50 Cross Up
                     if c3['low'] > c1['high']:
                         fvg_mid = (c3['low'] + c1['high']) / 2
                         is_at_mid = abs(current_price - fvg_mid) / current_price < 0.0001
                         lower_wick = min(c3['open'], c3['close']) - c3['low']
                         
-                        if is_at_mid and is_near_sr and is_vol_surge and (rsi_prev <= 50 <= rsi_now) and rsi_now >= 48 and lower_wick > (body * 0.3):
-                            msg = f"🏆 ELITE BULLISH: {asset}\nS/R + RSI 50 ✅\nFVG 50% Fill ✅\nVol Surge ✅\nRejection ✅"
+                        if is_at_mid and is_near_sr and is_vol_surge and (rsi_prev <= 50 <= rsi_now) and lower_wick > (body * 0.3):
+                            msg = f"🏆 ELITE BULLISH: {asset}\nS/R + RSI 50 ✅\nFVG 50% Fill ✅\nVol Surge ✅"
 
-                    # BEARISH: FVG 50% + S/R + RSI 50 Cross Down + Rejection
+                    # BEARISH: FVG 50% + S/R + RSI 50 Cross Down
                     elif c3['high'] < c1['low']:
                         fvg_mid = (c3['high'] + c1['low']) / 2
                         is_at_mid = abs(current_price - fvg_mid) / current_price < 0.0001
                         upper_wick = c3['high'] - max(c3['open'], c3['close'])
 
-                        if is_at_mid and is_near_sr and is_vol_surge and (rsi_prev >= 50 >= rsi_now) and rsi_now <= 52 and upper_wick > (body * 0.3):
-                            msg = f"🏆 ELITE BEARISH: {asset}\nS/R + RSI 50 ✅\nFVG 50% Fill ✅\nVol Surge ✅\nRejection ✅"
+                        if is_at_mid and is_near_sr and is_vol_surge and (rsi_prev >= 50 >= rsi_now) and upper_wick > (body * 0.3):
+                            msg = f"🏆 ELITE BEARISH: {asset}\nS/R + RSI 50 ✅\nFVG 50% Fill ✅\nVol Surge ✅"
 
                     if msg:
                         await send_tg_alert(bot, msg)
@@ -104,21 +106,18 @@ async def trade_loop(client, asset, bot):
 
 async def main():
     bot = Bot(token=TELEGRAM_TOKEN)
+    await send_tg_alert(bot, "🤖 Master Bot is starting on REAL account mode...")
+    
     while True:
-        client = AsyncPocketOptionClient(SSID, is_demo=True)
+        client = AsyncPocketOptionClient(SSID, is_demo=False)
         if await check_ssid_health(client, bot):
             try:
                 all_info = await client.get_all_asset_info()
                 target_pairs = [a[1] for a in all_info if a[3] == 'currency' and a[5] >= 92]
                 await send_tg_alert(bot, f"🛡️ Master Bot Active | {len(target_pairs)} Pairs (92%+)")
-                
-                async def monitor():
-                    while True:
-                        await asyncio.sleep(600)
-                        if not await check_ssid_health(client, bot): os._exit(1)
 
                 tasks = [trade_loop(client, p, bot) for p in target_pairs]
-                await asyncio.gather(*tasks, monitor())
+                await asyncio.gather(*tasks)
             except: pass
         await asyncio.sleep(300)
 
