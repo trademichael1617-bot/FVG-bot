@@ -4,3 +4,4 @@ pandas
 pytz
 flask
 websockets==13.1
+pyTelegramBotAPI
