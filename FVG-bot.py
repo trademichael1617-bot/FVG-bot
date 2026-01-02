@@ -4,106 +4,111 @@ import pandas_ta as ta
 import websocket
 import json
 import threading
+import time
 from datetime import datetime
 
-# --- SETTINGS ---
-TOKEN = 'YOUR_TELEGRAM_BOT_TOKEN'
-SSID = 'YOUR_POCKET_OPTION_SSID'
-CHAT_ID = 'YOUR_CHAT_ID'
+# ================== SETTINGS ==================
+TOKEN = "YOUR_TELEGRAM_BOT_TOKEN"
+SSID = "YOUR_POCKET_OPTION_SSID"
+CHAT_ID = "YOUR_CHAT_ID"
 bot = telebot.TeleBot(TOKEN)
 
-# Assets & Data Management
-active_92_assets = []
-market_data = {} 
+# ================== GLOBALS ==================
+market_history = {}
+MAX_HISTORY = 100
 
-# --- REFINED STRATEGY ENGINE ---
+# ================== STRATEGY ENGINE ==================
 
 def analyze_all_strategies(symbol, df, payout):
-    """Independent strategy executor with Volume Filter."""
-    
-    # 1. UNIVERSAL VOLUME FILTER (Tick Proxy)
-    # Checks if current activity is > 1.2x the recent average
-    df['vol_avg'] = df['volume'].rolling(window=5).mean()
-    high_volume = df['volume'].iloc[-1] > (df['vol_avg'].iloc[-1] * 1.2)
-    
-    if not high_volume:
-        return # No signal if market activity is low
+    if len(df) < 30: return
 
-    # STRATEGY 1: Breakout Strategy (Triangular Patterns)
-    # Uses RSI(10), MACD(12,26,9), SuperTrend(5,2)
+    # 1. UNIVERSAL VOLUME FILTER
+    df["body_size"] = abs(df["close"] - df["open"])
+    df["vol_avg"] = df["body_size"].rolling(5).mean()
+    if df["body_size"].iloc[-1] < df["vol_avg"].iloc[-1] * 1.2:
+        return
+
+    # --- STRATEGY 1: TRIANGULAR BREAKOUT ---
     df['rsi_10'] = ta.rsi(df['close'], length=10)
     st = ta.supertrend(df['high'], df['low'], df['close'], length=5, multiplier=2)
-    # Check if last candle closed outside the 5-period High/Low (Triangle base)
-    if df['close'].iloc[-1] > df['high'].iloc[-2: -6].max() and df['rsi_10'].iloc[-1] > 50:
-        send_master_signal(symbol, "Breakout strategy", payout)
+    # logic: Price breaks recent high + RSI > 50
+    if df['close'].iloc[-1] > df['high'].iloc[-5:-1].max() and df['rsi_10'].iloc[-1] > 55:
+        send_master_signal(symbol, "Breakout Strategy", payout)
 
-    # STRATEGY 2: SMC Strategy (FVG + S/R + RSI 50 Alignment)
-    # Personalized Rule: RSI must be in 48-52 zone
-    df['rsi_smc'] = ta.rsi(df['close'], length=10)
-    rsi_val = df['rsi_smc'].iloc[-1]
-    fvg_detected = df['low'].iloc[-1] > df['high'].iloc[-3] # Bullish FVG example
-    if fvg_detected and (48 <= rsi_val <= 52):
-        send_master_signal(symbol, "SMC strategy", payout)
+    # --- STRATEGY 2: SMC (RSI 50 CONFIRMED) ---
+    df["rsi"] = ta.rsi(df["close"], length=10)
+    rsi_now = df["rsi"].iloc[-1]
+    bullish_fvg = df["low"].iloc[-1] > df["high"].iloc[-3]
+    if (48 <= rsi_now <= 52) and bullish_fvg:
+        send_master_signal(symbol, "SMC Strategy", payout)
 
-    # STRATEGY 3: Indicator Analysis One (Stoch/MACD/RSI 7)
-    # Rule: All 3 indicators must align; Stochastic cannot lead
-    stoch = ta.stoch(df['high'], df['low'], df['close'], k=5, d=3, smooth_k=3)
-    df['rsi_7'] = ta.rsi(df['close'], length=7)
-    if df['rsi_7'].iloc[-1] > 50 and stoch['STOCHk_5_3_3'].iloc[-1] > 50:
-        send_master_signal(symbol, "indicator analysis one", payout)
+    # --- STRATEGY 3: INDICATOR ANALYSIS ONE ---
+    stoch = ta.stoch(df['high'], df['low'], df['close'], k=5, d=3)
+    macd = ta.macd(df['close'])
+    if stoch['STOCHk_5_3_3'].iloc[-1] > 80 and macd['MACDh_12_26_9'].iloc[-1] > 0:
+        send_master_signal(symbol, "Indicator Analysis One", payout)
 
-    # STRATEGY 4: Indicator Analysis Two (SMA 100/SuperTrend/Momentum)
-    # Rule: Volatility of new candle > previous
+    # --- STRATEGY 4: INDICATOR ANALYSIS TWO ---
     df['sma100'] = ta.sma(df['close'], length=100)
     df['mom'] = ta.mom(df['close'], length=10)
-    if df['mom'].iloc[-1] > df['mom'].iloc[-2] and df['close'].iloc[-1] > df['sma100'].iloc[-1]:
-        send_master_signal(symbol, "indicator analysis two", payout)
+    if df['close'].iloc[-1] > df['sma100'].iloc[-1] and df['mom'].iloc[-1] > df['mom'].iloc[-2]:
+        send_master_signal(symbol, "Indicator Analysis Two", payout)
 
-def send_master_signal(asset, strategy, payout):
-    msg = (f"🚨 **{strategy.upper()}**\n"
+def send_master_signal(symbol, strategy, payout):
+    msg = (f"🎯 **SIGNAL: {strategy}**\n"
            f"━━━━━━━━━━━━━━━\n"
-           f"📈 **Asset:** {asset}\n"
-           f"💰 **Payout:** {payout}%\n"
-           f"⏱ **Expiry:** 1 MIN\n"
-           f"📊 **Volume:** HIGH (Confirmed)")
+           f"📈 Asset: {symbol}\n"
+           f"💰 Payout: {payout}%\n"
+           f"⏰ Expiry: 1 MIN\n"
+           f"✅ Volume: Confirmed")
     bot.send_message(CHAT_ID, msg, parse_mode='Markdown')
 
-# --- SYSTEM NOTIFICATIONS ---
+# ================== SYSTEM UTILITIES ==================
 
-def start_heartbeat():
-    bot.send_message(CHAT_ID, "🚀 **BOT IS LIVE & SCANNING**")
-    def pulse():
-        while True:
-            time.sleep(3600)
-            bot.send_message(CHAT_ID, "🟢 **HOURLY UPDATE:** Bot is active.")
-    threading.Thread(target=pulse, daemon=True).start()
-
-# --- WEBSOCKET HANDLER ---
+def hourly_heartbeat():
+    while True:
+        time.sleep(3600)
+        bot.send_message(CHAT_ID, "🟢 **BOT STATUS:** Active and Scanning.")
 
 def on_message(ws, message):
-    if message.startswith('42'):
+    if not message.startswith("42"): return
+    try:
         data = json.loads(message[2:])
-        msg_type, payload = data[0], data[1]
-        
-        # Payout Scanner (92% Filter)
-        if msg_type == "success_auth":
-            assets = payload.get('assets', [])
-            for a in assets:
-                if a['profit'] == 92:
-                    ws.send(f'42["subscribeCandles", {{"asset": "{a["name"]}", "period": 60}}]')
-        
-        # SSID Expiry Alert
-        if msg_type == "error" and "auth" in str(payload).lower():
-            bot.send_message(CHAT_ID, "⚠️ **SSID EXPIRED!** Bot Stopped.")
-            ws.close()
+        event, payload = data[0], data[1]
+
+        if event == "success_auth":
+            for asset in payload.get("assets", []):
+                if asset.get("profit") == 92:
+                    ws.send(f'42["subscribeCandles", {{"asset": "{asset["name"]}", "period": 60}}]')
+
+        if event == "error" and "auth" in str(payload).lower():
+            bot.send_message(CHAT_ID, "⚠️ **SSID EXPIRED!** Please update your session key.")
+
+        if event == "candle":
+            symbol = payload["asset"]
+            candle = {"open": payload["open"], "high": payload["high"], "low": payload["low"], "close": payload["close"], "time": payload["time"]}
+            if symbol not in market_history: market_history[symbol] = []
+            
+            if not market_history[symbol] or market_history[symbol][-1]["time"] != candle["time"]:
+                market_history[symbol].append(candle)
+            else:
+                market_history[symbol][-1] = candle
+
+            if len(market_history[symbol]) >= 30:
+                analyze_all_strategies(symbol, pd.DataFrame(market_history[symbol]), 92)
+
+    except Exception as e: print(f"Error: {e}")
 
 def connect():
-    start_heartbeat()
-    ws = websocket.WebSocketApp("wss://api.po.market/socket.io/?EIO=4&transport=websocket",
-                                on_message=on_message,
-                                header={"Cookie": f"SSID={SSID}"})
-    ws.run_forever(ping_interval=20)
+    while True:
+        try:
+            ws = websocket.WebSocketApp("wss://api.po.market/socket.io/?EIO=4&transport=websocket",
+                                        on_message=on_message, header=[f"Cookie: SSID={SSID}"])
+            ws.run_forever(ping_interval=25)
+        except: time.sleep(5)
 
 if __name__ == "__main__":
-    threading.Thread(target=connect).start()
+    bot.send_message(CHAT_ID, "🚀 **BOT STARTED:** Master Script is live.")
+    threading.Thread(target=hourly_heartbeat, daemon=True).start()
+    threading.Thread(target=connect, daemon=True).start()
     bot.infinity_polling()
