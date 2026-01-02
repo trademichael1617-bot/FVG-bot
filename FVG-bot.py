@@ -26,11 +26,16 @@ async def send_tg_alert(bot, msg):
     try: await bot.send_message(chat_id=CHAT_ID, text=msg)
     except: pass
 
-def calculate_rsi(series, period=10):
-    delta = series.diff()
-    gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
-    loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
-    return 100 - (100 / (1 + (gain / (loss + 1e-9))))
+def calculate_indicators(df):
+    # RSI 10
+    delta = df['close'].diff()
+    gain = (delta.where(delta > 0, 0)).rolling(window=10).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(window=10).mean()
+    df['rsi'] = 100 - (100 / (1 + (gain / (loss + 1e-9))))
+    
+    # Volume Average for Surge Detection
+    df['vol_avg'] = df['volume'].rolling(window=10).mean()
+    return df
 
 def find_sr_zones(df, window=30):
     levels = []
@@ -46,46 +51,42 @@ async def trade_loop(client, asset, bot):
         try:
             df = await client.get_candles_dataframe(asset=asset, timeframe=60, count=250)
             if df is not None and not df.empty:
-                df['rsi'] = calculate_rsi(df['close'], period=10)
+                df = calculate_indicators(df)
                 
                 c1, c2, c3 = df.iloc[-3], df.iloc[-2], df.iloc[-1]
-                rsi_now = df['rsi'].iloc[-1]
-                rsi_prev = df['rsi'].iloc[-2]
+                rsi_now, rsi_prev = df['rsi'].iloc[-1], df['rsi'].iloc[-2]
+                vol_now, vol_avg = df['volume'].iloc[-1], df['vol_avg'].iloc[-1]
                 current_price = c3['close']
                 timestamp = df.index[-1]
 
-                # Identify 30-Candle S/R
                 sr_levels = find_sr_zones(df, window=30)
                 is_near_sr = any(abs(current_price - level) / current_price < 0.0002 for level in sr_levels)
+                is_vol_surge = vol_now > vol_avg # Volume Filter
 
                 if last_alerts.get(asset) != timestamp:
                     msg = None
                     
-                    # BULLISH: FVG 50% + S/R + RSI 48/50 + REJECTION WICK
+                    # BULLISH: FVG 50% + S/R + RSI 48/50 + Rejection + Volume
                     if c3['low'] > c1['high']:
                         fvg_mid = (c3['low'] + c1['high']) / 2
                         is_at_mid = abs(current_price - fvg_mid) / current_price < 0.0001
                         
-                        # Rejection Check: Lower wick must be at least 30% of the candle body
-                        candle_body = abs(c3['open'] - c3['close'])
                         lower_wick = min(c3['open'], c3['close']) - c3['low']
-                        has_rejection = lower_wick > (candle_body * 0.3)
+                        body = abs(c3['open'] - c3['close'])
+                        
+                        if is_at_mid and is_near_sr and is_vol_surge and (rsi_prev <= 50 <= rsi_now) and rsi_now >= 48 and lower_wick > (body * 0.3):
+                            msg = f"🏆 ELITE BULLISH: {asset}\nGap: 50% FVG Fill ✅\nS/R: 30-Candle Support ✅\nRSI: 50 Cross (Base 48) ✅\nVol: Surge Detected ✅"
 
-                        if is_at_mid and is_near_sr and (rsi_prev <= 50 <= rsi_now) and rsi_now >= 48 and has_rejection:
-                            msg = f"🔥 ELITE BUY: {asset}\nGap: FVG 50% Fill ✅\nS/R: 30-Candle Support ✅\nRSI: 50 Cross (Base 48) ✅\nPrice: Rejection Wick Detected ✅"
-
-                    # BEARISH: FVG 50% + S/R + RSI 52/50 + REJECTION WICK
+                    # BEARISH: FVG 50% + S/R + RSI 52/50 + Rejection + Volume
                     elif c3['high'] < c1['low']:
                         fvg_mid = (c3['high'] + c1['low']) / 2
                         is_at_mid = abs(current_price - fvg_mid) / current_price < 0.0001
                         
-                        # Rejection Check: Upper wick must be at least 30% of the candle body
-                        candle_body = abs(c3['open'] - c3['close'])
                         upper_wick = c3['high'] - max(c3['open'], c3['close'])
-                        has_rejection = upper_wick > (candle_body * 0.3)
+                        body = abs(c3['open'] - c3['close'])
 
-                        if is_at_mid and is_near_sr and (rsi_prev >= 50 >= rsi_now) and rsi_now <= 52 and has_rejection:
-                            msg = f"🧊 ELITE SELL: {asset}\nGap: FVG 50% Fill ✅\nS/R: 30-Candle Resist ✅\nRSI: 50 Cross (Base 52) ✅\nPrice: Rejection Wick Detected ✅"
+                        if is_at_mid and is_near_sr and is_vol_surge and (rsi_prev >= 50 >= rsi_now) and rsi_now <= 52 and upper_wick > (body * 0.3):
+                            msg = f"🏆 ELITE BEARISH: {asset}\nGap: 50% FVG Fill ✅\nS/R: 30-Candle Resist ✅\nRSI: 50 Cross (Base 52) ✅\nVol: Surge Detected ✅"
 
                     if msg:
                         await send_tg_alert(bot, msg)
@@ -93,4 +94,19 @@ async def trade_loop(client, asset, bot):
         except: pass
         await asyncio.sleep(15)
 
-# (main() function remains the same as previous version)
+async def main():
+    bot = Bot(token=TELEGRAM_TOKEN)
+    while True:
+        client = AsyncPocketOptionClient(SSID, is_demo=True)
+        try:
+            if await client.connect():
+                all_info = await client.get_all_asset_info()
+                target_pairs = [a[1] for a in all_info if a[3] == 'currency' and a[5] >= 92]
+                await send_tg_alert(bot, f"🛡️ Master Bot Active\nMonitoring {len(target_pairs)} pairs (92%+)\nVolume + Rejection Enabled.")
+                tasks = [trade_loop(client, p, bot) for p in target_pairs]
+                await asyncio.gather(*tasks)
+        except: pass
+        await asyncio.sleep(300)
+
+if __name__ == "__main__":
+    asyncio.run(main())
