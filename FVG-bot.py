@@ -1,3 +1,4 @@
+import os
 import telebot
 import pandas as pd
 import pandas_ta as ta
@@ -8,11 +9,18 @@ import time
 from datetime import datetime
 
 # ================== SETTINGS ==================
-TOKEN = "YOUR_TELEGRAM_BOT_TOKEN"
-SSID = "YOUR_POCKET_OPTION_SSID"
-CHAT_ID = "YOUR_CHAT_ID"
-bot = telebot.TeleBot(TOKEN)
+# Load all configurations from Environment Variables
+TOKEN = os.getenv("TELEGRAM_TOKEN")
+CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+SSID = os.getenv("PO_SSID")
 
+# Validation check
+if not all([TOKEN, CHAT_ID, SSID]):
+    print("❌ ERROR: Missing one or more Environment Variables!")
+else:
+    bot = telebot.TeleBot(TOKEN)
+    print("✅ Bot configurations loaded successfully.")
+    
 # ================== GLOBALS ==================
 market_history = {}
 MAX_HISTORY = 100
