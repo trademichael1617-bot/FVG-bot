@@ -43,37 +43,46 @@ def analyze_all_strategies(symbol, df, payout):
     if df["body_size"].iloc[-1] < df["vol_avg"].iloc[-1] * 1.2:
         return
 
-    # --- STRATEGY 1: TRIANGULAR BREAKOUT ---
+    # --- STRATEGY 1: TRIANGULAR BREAKOUT (REVISED) ---
     df['rsi_10'] = ta.rsi(df['close'], length=10)
+    # BUY: Price breaks 5-candle high + RSI > 55
     if df['close'].iloc[-1] > df['high'].iloc[-5:-1].max() and df['rsi_10'].iloc[-1] > 55:
         send_master_signal(symbol, "Breakout Strategy", payout, "UP 🟢")
+    # SELL: Price breaks 5-candle low + RSI < 45
+    elif df['close'].iloc[-1] < df['low'].iloc[-5:-1].min() and df['rsi_10'].iloc[-1] < 45:
+        send_master_signal(symbol, "Breakout Strategy", payout, "DOWN 🔴")
 
     # --- STRATEGY 2: SMC (RSI 50 ALIGNMENT) ---
     df["rsi"] = ta.rsi(df["close"], length=10)
     rsi_now = df["rsi"].iloc[-1]
-    
-    # Bullish FVG + RSI Support at 50
+    # Bullish FVG (Buy)
     bullish_fvg = df["low"].iloc[-1] > df["high"].iloc[-3]
     if (49 <= rsi_now <= 53) and bullish_fvg:
         send_master_signal(symbol, "SMC CALL (RSI 50 Support)", payout, "UP 🟢")
-
-    # Bearish FVG + RSI Resistance at 50
+    # Bearish FVG (Sell)
     bearish_fvg = df["high"].iloc[-1] < df["low"].iloc[-3]
     if (47 <= rsi_now <= 51) and bearish_fvg:
         send_master_signal(symbol, "SMC PUT (RSI 50 Resistance)", payout, "DOWN 🔴")
 
-    # --- STRATEGY 3: INDICATOR ANALYSIS ONE ---
+    # --- STRATEGY 3: INDICATOR ANALYSIS ONE (STOCH/MACD) ---
     stoch = ta.stoch(df['high'], df['low'], df['close'], k=5, d=3)
     macd = ta.macd(df['close'])
+    # BUY: Stoch Overbought + MACD Positive
     if stoch['STOCHk_5_3_3'].iloc[-1] > 80 and macd['MACDh_12_26_9'].iloc[-1] > 0:
         send_master_signal(symbol, "Indicator Analysis One", payout, "UP 🟢")
+    # SELL: Stoch Oversold + MACD Negative
+    elif stoch['STOCHk_5_3_3'].iloc[-1] < 20 and macd['MACDh_12_26_9'].iloc[-1] < 0:
+        send_master_signal(symbol, "Indicator Analysis One", payout, "DOWN 🔴")
 
-    # --- STRATEGY 4: INDICATOR ANALYSIS TWO ---
+    # --- STRATEGY 4: INDICATOR ANALYSIS TWO (TREND/MOM) ---
     df['sma100'] = ta.sma(df['close'], length=100)
     df['mom'] = ta.mom(df['close'], length=10)
+    # BUY: Above SMA100 + Momentum Increasing
     if df['close'].iloc[-1] > df['sma100'].iloc[-1] and df['mom'].iloc[-1] > df['mom'].iloc[-2]:
         send_master_signal(symbol, "Indicator Analysis Two", payout, "UP 🟢")
-
+    # SELL: Below SMA100 + Momentum Decreasing
+    elif df['close'].iloc[-1] < df['sma100'].iloc[-1] and df['mom'].iloc[-1] < df['mom'].iloc[-2]:
+        send_master_signal(symbol, "Indicator Analysis Two", payout, "DOWN 🔴")
 def send_master_signal(symbol, strategy, payout, direction):
     msg = (f"🎯 **SIGNAL: {strategy}**\n"
            f"━━━━━━━━━━━━━━━\n"
