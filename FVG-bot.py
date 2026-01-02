@@ -7,7 +7,22 @@ import json
 import threading
 import time
 from datetime import datetime
+from flask import Flask
 
+# Create a tiny web server to trick Render
+app = Flask(__name__)
+
+@app.route('/')
+def home():
+    return "Bot is running!"
+
+def run_web_server():
+    # Render provides a PORT environment variable automatically
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host='0.0.0.0', port=port)
+
+# Start the web server in a separate thread
+threading.Thread(target=run_web_server, daemon=True).start()
 # ================== SETTINGS ==================
 # Load all configurations from Environment Variables
 TOKEN = os.getenv("TELEGRAM_TOKEN")
