@@ -129,9 +129,22 @@ def connect():
                                         on_message=on_message, header=[f"Cookie: SSID={SSID}"])
             ws.run_forever(ping_interval=25)
         except: time.sleep(5)
+# ================== MAIN EXECUTION ==================
 
 if __name__ == "__main__":
-    bot.send_message(CHAT_ID, "🚀 **BOT STARTED:** Master Script is live.")
-    threading.Thread(target=hourly_heartbeat, daemon=True).start()
+    # 1. Start Web Server (Keep-Alive)
+    threading.Thread(target=run_web_server, daemon=True).start()
+    
+    # 2. Wait for Render to settle
+    time.sleep(5)
+    
+    # 3. Start Market Connection
     threading.Thread(target=connect, daemon=True).start()
-    bot.infinity_polling()
+    
+    print("🚀 Bot is running...")
+    bot.send_message(CHAT_ID, "🚀 **BOT STARTED:** Monitoring RSI 50 & SMC.")
+    
+    # 4. Start Telegram Polling (One instance only!)
+    bot.infinity_polling(skip_pending=True)
+    # Use skip_pending to avoid flooding and conflict loops
+    bot.infinity_polling(skip_pending=True)
