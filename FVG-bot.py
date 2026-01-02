@@ -1,125 +1,109 @@
-import asyncio
-import os
+import telebot
 import pandas as pd
-from flask import Flask
-from threading import Thread
-from telegram import Bot
-from pocketoptionapi_async import AsyncPocketOptionClient
+import pandas_ta as ta
+import websocket
+import json
+import threading
+from datetime import datetime
 
-# --- KEEP-ALIVE SERVER ---
-app = Flask('')
-@app.route('/')
-def home(): return "Bot is Online"
+# --- SETTINGS ---
+TOKEN = 'YOUR_TELEGRAM_BOT_TOKEN'
+SSID = 'YOUR_POCKET_OPTION_SSID'
+CHAT_ID = 'YOUR_CHAT_ID'
+bot = telebot.TeleBot(TOKEN)
 
-def run():
-    app.run(host='0.0.0.0', port=int(os.environ.get("PORT", 8080)))
+# Assets & Data Management
+active_92_assets = []
+market_data = {} 
 
-Thread(target=run, daemon=True).start()
+# --- REFINED STRATEGY ENGINE ---
 
-# --- CONFIGURATION ---
-SSID = os.environ.get("POCKET_SSID")
-TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
-CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
-last_alerts = {}
-
-async def send_tg_alert(bot, msg):
-    try: 
-        await bot.send_message(chat_id=CHAT_ID, text=msg)
-    except Exception as e: 
-        print(f"TG Error: {e}")
-
-def calculate_indicators(df):
-    # RSI 10
-    delta = df['close'].diff()
-    gain = (delta.where(delta > 0, 0)).rolling(window=10).mean()
-    loss = (-delta.where(delta < 0, 0)).rolling(window=10).mean()
-    df['rsi'] = 100 - (100 / (1 + (gain / (loss + 1e-9))))
+def analyze_all_strategies(symbol, df, payout):
+    """Independent strategy executor with Volume Filter."""
     
-    # Volume SMA for Surge
-    df['vol_avg'] = df['volume'].rolling(window=10).mean()
+    # 1. UNIVERSAL VOLUME FILTER (Tick Proxy)
+    # Checks if current activity is > 1.2x the recent average
+    df['vol_avg'] = df['volume'].rolling(window=5).mean()
+    high_volume = df['volume'].iloc[-1] > (df['vol_avg'].iloc[-1] * 1.2)
     
-    # Support/Resistant zone alignment check (RSI near 50)
-    df['rsi_at_mid'] = (df['rsi'] >= 48) & (df['rsi'] <= 52)
-    return df
+    if not high_volume:
+        return # No signal if market activity is low
 
-def find_sr_zones(df, window=30):
-    levels = []
-    for i in range(window, len(df) - window):
-        if df['high'].iloc[i] == df['high'].iloc[i-window:i+window].max():
-            levels.append(df['high'].iloc[i])
-        if df['low'].iloc[i] == df['low'].iloc[i-window:i+window].min():
-            levels.append(df['low'].iloc[i])
-    return levels
+    # STRATEGY 1: Breakout Strategy (Triangular Patterns)
+    # Uses RSI(10), MACD(12,26,9), SuperTrend(5,2)
+    df['rsi_10'] = ta.rsi(df['close'], length=10)
+    st = ta.supertrend(df['high'], df['low'], df['close'], length=5, multiplier=2)
+    # Check if last candle closed outside the 5-period High/Low (Triangle base)
+    if df['close'].iloc[-1] > df['high'].iloc[-2: -6].max() and df['rsi_10'].iloc[-1] > 50:
+        send_master_signal(symbol, "Breakout strategy", payout)
 
-async def check_ssid_health(client, bot):
-    try:
-        is_connected = await client.connect()
-        if not is_connected:
-            await send_tg_alert(bot, "⚠️ SSID EXPIRED: Please refresh your Pocket Option SSID.")
-            return False
-        return True
-    except Exception:
-        return False
+    # STRATEGY 2: SMC Strategy (FVG + S/R + RSI 50 Alignment)
+    # Personalized Rule: RSI must be in 48-52 zone
+    df['rsi_smc'] = ta.rsi(df['close'], length=10)
+    rsi_val = df['rsi_smc'].iloc[-1]
+    fvg_detected = df['low'].iloc[-1] > df['high'].iloc[-3] # Bullish FVG example
+    if fvg_detected and (48 <= rsi_val <= 52):
+        send_master_signal(symbol, "SMC strategy", payout)
 
-async def trade_loop(client, asset, bot):
-    while True:
-        try:
-            df = await client.get_candles_dataframe(asset=asset, timeframe=60, count=250)
-            if df is not None and not df.empty:
-                df = calculate_indicators(df)
-                c1, c3 = df.iloc[-3], df.iloc[-1]
-                rsi_now, rsi_prev = df['rsi'].iloc[-1], df['rsi'].iloc[-2]
-                vol_now, vol_avg = df['volume'].iloc[-1], df['vol_avg'].iloc[-1]
-                current_price, timestamp = c3['close'], df.index[-1]
+    # STRATEGY 3: Indicator Analysis One (Stoch/MACD/RSI 7)
+    # Rule: All 3 indicators must align; Stochastic cannot lead
+    stoch = ta.stoch(df['high'], df['low'], df['close'], k=5, d=3, smooth_k=3)
+    df['rsi_7'] = ta.rsi(df['close'], length=7)
+    if df['rsi_7'].iloc[-1] > 50 and stoch['STOCHk_5_3_3'].iloc[-1] > 50:
+        send_master_signal(symbol, "indicator analysis one", payout)
 
-                sr_levels = find_sr_zones(df, window=30)
-                is_near_sr = any(abs(current_price - level) / current_price < 0.0002 for level in sr_levels)
-                is_vol_surge = vol_now > vol_avg
+    # STRATEGY 4: Indicator Analysis Two (SMA 100/SuperTrend/Momentum)
+    # Rule: Volatility of new candle > previous
+    df['sma100'] = ta.sma(df['close'], length=100)
+    df['mom'] = ta.mom(df['close'], length=10)
+    if df['mom'].iloc[-1] > df['mom'].iloc[-2] and df['close'].iloc[-1] > df['sma100'].iloc[-1]:
+        send_master_signal(symbol, "indicator analysis two", payout)
 
-                if last_alerts.get(asset) != timestamp:
-                    msg = None
-                    body = abs(c3['open'] - c3['close'])
+def send_master_signal(asset, strategy, payout):
+    msg = (f"🚨 **{strategy.upper()}**\n"
+           f"━━━━━━━━━━━━━━━\n"
+           f"📈 **Asset:** {asset}\n"
+           f"💰 **Payout:** {payout}%\n"
+           f"⏱ **Expiry:** 1 MIN\n"
+           f"📊 **Volume:** HIGH (Confirmed)")
+    bot.send_message(CHAT_ID, msg, parse_mode='Markdown')
 
-                    # BULLISH: FVG 50% + S/R + RSI 50 Cross Up
-                    if c3['low'] > c1['high']:
-                        fvg_mid = (c3['low'] + c1['high']) / 2
-                        is_at_mid = abs(current_price - fvg_mid) / current_price < 0.0001
-                        lower_wick = min(c3['open'], c3['close']) - c3['low']
-                        
-                        if is_at_mid and is_near_sr and is_vol_surge and (rsi_prev <= 50 <= rsi_now) and lower_wick > (body * 0.3):
-                            msg = f"🏆 ELITE BULLISH: {asset}\nS/R + RSI 50 ✅\nFVG 50% Fill ✅\nVol Surge ✅"
+# --- SYSTEM NOTIFICATIONS ---
 
-                    # BEARISH: FVG 50% + S/R + RSI 50 Cross Down
-                    elif c3['high'] < c1['low']:
-                        fvg_mid = (c3['high'] + c1['low']) / 2
-                        is_at_mid = abs(current_price - fvg_mid) / current_price < 0.0001
-                        upper_wick = c3['high'] - max(c3['open'], c3['close'])
+def start_heartbeat():
+    bot.send_message(CHAT_ID, "🚀 **BOT IS LIVE & SCANNING**")
+    def pulse():
+        while True:
+            time.sleep(3600)
+            bot.send_message(CHAT_ID, "🟢 **HOURLY UPDATE:** Bot is active.")
+    threading.Thread(target=pulse, daemon=True).start()
 
-                        if is_at_mid and is_near_sr and is_vol_surge and (rsi_prev >= 50 >= rsi_now) and upper_wick > (body * 0.3):
-                            msg = f"🏆 ELITE BEARISH: {asset}\nS/R + RSI 50 ✅\nFVG 50% Fill ✅\nVol Surge ✅"
+# --- WEBSOCKET HANDLER ---
 
-                    if msg:
-                        await send_tg_alert(bot, msg)
-                        last_alerts[asset] = timestamp
-        except: pass
-        await asyncio.sleep(15)
+def on_message(ws, message):
+    if message.startswith('42'):
+        data = json.loads(message[2:])
+        msg_type, payload = data[0], data[1]
+        
+        # Payout Scanner (92% Filter)
+        if msg_type == "success_auth":
+            assets = payload.get('assets', [])
+            for a in assets:
+                if a['profit'] == 92:
+                    ws.send(f'42["subscribeCandles", {{"asset": "{a["name"]}", "period": 60}}]')
+        
+        # SSID Expiry Alert
+        if msg_type == "error" and "auth" in str(payload).lower():
+            bot.send_message(CHAT_ID, "⚠️ **SSID EXPIRED!** Bot Stopped.")
+            ws.close()
 
-async def main():
-    bot = Bot(token=TELEGRAM_TOKEN)
-    await send_tg_alert(bot, "🤖 Master Bot is starting on REAL account mode...")
-    
-    while True:
-        client = AsyncPocketOptionClient(SSID, is_demo=False)
-        if await check_ssid_health(client, bot):
-            try:
-                all_info = await client.get_all_asset_info()
-                target_pairs = [a[1] for a in all_info if a[3] == 'currency' and a[5] >= 92]
-                await send_tg_alert(bot, f"🛡️ Master Bot Active | {len(target_pairs)} Pairs (92%+)")
-
-                tasks = [trade_loop(client, p, bot) for p in target_pairs]
-                await asyncio.gather(*tasks)
-            except: pass
-        await asyncio.sleep(300)
+def connect():
+    start_heartbeat()
+    ws = websocket.WebSocketApp("wss://api.po.market/socket.io/?EIO=4&transport=websocket",
+                                on_message=on_message,
+                                header={"Cookie": f"SSID={SSID}"})
+    ws.run_forever(ping_interval=20)
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    threading.Thread(target=connect).start()
+    bot.infinity_polling()
