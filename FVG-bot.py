@@ -1,190 +1,276 @@
-# import os, telebot, pandas as pd, pandas_ta as ta
-# import websocket, json, threading, time, requests, functools
+import os, telebot, pandas as pd, pandas_ta as ta
+import websocket, json, threading, time, requests, functools, logging
+from flask import Flask
 
-# print = functools.partial(print, flush=True)
+# ================== LOGGING ==================
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s",
+    handlers=[logging.StreamHandler()]
+)
+print = functools.partial(print, flush=True)
 
-# # ================== SYSTEM CONFIG ==================
-# TOKEN = os.getenv("TELEGRAM_TOKEN", "8390314643:AAEU7UBAjTbM42J58klEIkBi83nt-uH5aB4")
-# CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "-1003505344399")
-# SSID = os.getenv("PO_SSID", "abf1c651aa72419a6b77e0f5360f1f54")
-# NEWS_URL = "https://script.google.com/macros/s/AKfycbzC0brtkaV6X4jWWRhAli14uCM7w_t-e_7Pom3A76CnCVn5afdUKUkMF3k7qbdZfIvFaw/exec"
+# ================== SYSTEM CONFIG ==================
+TOKEN = os.getenv("TELEGRAM_TOKEN")
+CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+SSID = os.getenv("PO_SSID")
+NEWS_URL = "https://script.google.com/macros/s/AKfycbzC0brtkaV6X4jWWRhAli14uCM7w_t-e_7Pom3A76CnCVn5afdUKUkMF3k7qbdZfIvFaw/exec"
 
-# bot = telebot.TeleBot(TOKEN)
+bot = telebot.TeleBot(TOKEN)
 
-# market_history = {}
-# stats = {"total": 0, "wins": 0, "losses": 0}
-# active_news_events = []
-# last_signal_time = {}
+market_history = {}
+stats = {"total": 0, "wins": 0, "losses": 0}
+active_news_events = []
+last_signal_time = {}
+early_alerts = {}  # 7-second alert tracking
 
-# # ================== NEWS FILTER ==================
-# def is_asset_blocked(symbol):
-#     if len(symbol) < 6:
-#         return False
-#     base, quote = symbol[:3], symbol[3:]
-#     return base in active_news_events or quote in active_news_events
+# ================== VOLATILITY ==================
+VOLATILITY_STATE = {}  # per-symbol
+LOW_VOL_THRESHOLD = 0.6
+HIGH_VOL_THRESHOLD = 0.9
+VOL_ALERT_COOLDOWN = 300
 
-# def update_news_calendar():
-#     global active_news_events
-#     while True:
-#         try:
-#             r = requests.get(NEWS_URL, timeout=15)
-#             active_news_events = r.json()
-#         except Exception as e:
-#             print(f"News Update Error: {e}")
-#         time.sleep(300)
+def init_volatility_state(symbol):
+    if symbol not in VOLATILITY_STATE:
+        VOLATILITY_STATE[symbol] = {"enabled": True, "last_alert": 0}
 
-# # ================== STRATEGY ENGINE ==================
-# def analyze_all_strategies(symbol, df):
-#     if len(df) < 125 or is_asset_blocked(symbol):
-#         return
+# ================== NEWS FILTER ==================
+def is_asset_blocked(symbol):
+    if len(symbol) < 6:
+        return False
+    clean = symbol.replace("_otc", "")
+    base, quote = clean[:3], clean[3:6]
+    blocked = base in active_news_events or quote in active_news_events
+    if blocked:
+        logging.info(f"{symbol} blocked due to news: {active_news_events}")
+    return blocked
 
-#     now = time.time()
-#     if symbol in last_signal_time and now - last_signal_time[symbol] < 60:
-#         return
+def update_news_calendar():
+    global active_news_events
+    while True:
+        try:
+            r = requests.get(NEWS_URL, timeout=15)
+            active_news_events = r.json()
+            logging.info(f"News calendar updated: {active_news_events}")
+        except Exception as e:
+            logging.error(f"News Update Error: {e}")
+        time.sleep(300)
 
-#     curr_price = df["close"].iloc[-1]
+# ================== VOLATILITY CHECK ==================
+def check_market_volatility(symbol, df):
+    init_volatility_state(symbol)
+    if len(df) < 50:
+        return
 
-#     # ===== INDICATORS =====
-#     df["rsi7"] = ta.rsi(df["close"], 7)
-#     df["rsi10"] = ta.rsi(df["close"], 10)
+    atr = ta.atr(df["high"], df["low"], df["close"], 14)
+    if atr is None or atr.isna().iloc[-1]:
+        return
 
-#     macd = ta.macd(df["close"], 12, 26, 9)
-#     if macd is None or macd.empty:
-#         return
+    curr_atr = atr.iloc[-1]
+    avg_atr = atr.iloc[-30:].mean()
+    ratio = curr_atr / avg_atr if avg_atr > 0 else 0
+    now = time.time()
 
-#     mh = macd.iloc[:, -1].iloc[-1]  # ✅ Correct histogram
+    # Low Volatility — Pause this currency
+    if ratio < LOW_VOL_THRESHOLD and VOLATILITY_STATE[symbol]["enabled"]:
+        if now - VOLATILITY_STATE[symbol]["last_alert"] > VOL_ALERT_COOLDOWN:
+            VOLATILITY_STATE[symbol]["enabled"] = False
+            VOLATILITY_STATE[symbol]["last_alert"] = now
+            bot.send_message(
+                CHAT_ID,
+                f"🛑 **LOW VOLATILITY DETECTED**\n"
+                f"📉 Trading paused for {symbol}\n"
+                f"📊 ATR Ratio: {ratio:.2f}",
+                parse_mode="Markdown"
+            )
+            logging.warning(f"{symbol} PAUSED — LOW VOLATILITY | ATR {ratio:.2f}")
 
-#     sync_bull = df["rsi7"].iloc[-1] > 50 and mh > 0
-#     sync_bear = df["rsi7"].iloc[-1] < 50 and mh < 0
+    # High Volatility — Resume this currency
+    elif ratio >= HIGH_VOL_THRESHOLD and not VOLATILITY_STATE[symbol]["enabled"]:
+        if now - VOLATILITY_STATE[symbol]["last_alert"] > VOL_ALERT_COOLDOWN:
+            VOLATILITY_STATE[symbol]["enabled"] = True
+            VOLATILITY_STATE[symbol]["last_alert"] = now
+            bot.send_message(
+                CHAT_ID,
+                f"✅ **VOLATILITY RESTORED**\n"
+                f"📈 Trading resumed for {symbol}\n"
+                f"📊 ATR Ratio: {ratio:.2f}",
+                parse_mode="Markdown"
+            )
+            logging.info(f"{symbol} RESUMED — VOLATILITY NORMAL | ATR {ratio:.2f}")
 
-#     # ===== S1: FVG FLIP =====
-#     bull_fvg = df["low"].iloc[-2] > df["high"].iloc[-4]
-#     bear_fvg = df["high"].iloc[-2] < df["low"].iloc[-4]
-#     rsi_align = 48 <= df["rsi10"].iloc[-1] <= 52
+# ================== STRATEGY ENGINE ==================
+def analyze_all_strategies(symbol, df):
+    if len(df) < 100:
+        logging.info(f"{symbol} skipped: not enough candles ({len(df)})")
+        return
+    curr_price = df["close"].iloc[-1]
+    init_volatility_state(symbol)
+    check_market_volatility(symbol, df)
 
-#     if bull_fvg and rsi_align and sync_bull:
-#         trigger_signal(symbol, "S1: FVG FLIP", "UP 🟢", curr_price)
-#         return
-#     if bear_fvg and rsi_align and sync_bear:
-#         trigger_signal(symbol, "S1: FVG FLIP", "DOWN 🔴", curr_price)
-#         return
+    if not VOLATILITY_STATE[symbol]["enabled"]:
+        logging.info(f"{symbol} skipped: low volatility")
+        return
+    if is_asset_blocked(symbol):
+        return
 
-#     # ===== S2: TRIANGLE SYNC =====
-#     recent_h = df["high"].iloc[-15:-1]
-#     recent_l = df["low"].iloc[-15:-1]
+    # ------------------- STRATEGIES -------------------
+    # S1: FVG Flip
+    df["rsi10"] = ta.rsi(df["close"], 10)
+    rsi = df["rsi10"].iloc[-1]
+    rsi_align = 45 <= rsi <= 55
+    if df["low"].iloc[-2] > df["high"].iloc[-4] and rsi_align:
+        schedule_early_alert(symbol, "S1: FVG FLIP", "UP 🟢", curr_price)
+        return
+    if df["high"].iloc[-2] < df["low"].iloc[-4] and rsi_align:
+        schedule_early_alert(symbol, "S1: FVG FLIP", "DOWN 🔴", curr_price)
+        return
 
-#     pk1, pk2 = recent_h[:7].max(), recent_h[7:].max()
-#     fl1, fl2 = recent_l[:7].min(), recent_l[7:].min()
+    # S2: Triangle Breakout
+    atr = ta.atr(df["high"], df["low"], df["close"], 14)
+    if atr is None or atr.isna().iloc[-1]:
+        return
+    atr_val = atr.iloc[-1]
+    range_ = df["high"].iloc[-15:-1].max() - df["low"].iloc[-15:-1].min()
+    if range_ < atr_val * 1.2:
+        recent_high = df["high"].iloc[-15:-1].max()
+        recent_low = df["low"].iloc[-15:-1].min()
+        macd = ta.macd(df["close"], 12, 26, 9)
+        if macd is None or macd.empty:
+            return
+        mh = macd["MACDh_12_26_9"].iloc[-1]
+        st = ta.supertrend(df["high"], df["low"], df["close"], length=5, multiplier=2)
+        st_dir = st["SUPERTd_5_2"].iloc[-1]
 
-#     vol_ma = df["volume"].rolling(20).mean().iloc[-1]
+        if curr_price > recent_high and rsi_align and mh > 0 and st_dir == 1:
+            schedule_early_alert(symbol, "S2: TRIANGLE BREAKOUT", "UP 🟢", curr_price)
+            return
+        if curr_price < recent_low and rsi_align and mh < 0 and st_dir == -1:
+            schedule_early_alert(symbol, "S2: TRIANGLE BREAKOUT", "DOWN 🔴", curr_price)
+            return
 
-#     if abs(pk1 - pk2) < curr_price * 0.0002 and fl2 > fl1:
-#         if curr_price > pk2 and sync_bull and df["volume"].iloc[-1] > vol_ma:
-#             trigger_signal(symbol, "S2: TRIANGLE SYNC", "UP 🟢", curr_price)
-#             return
+    # S3: Sync Scalp
+    stoch = ta.stoch(df["high"], df["low"], df["close"], 5, 3, 3)
+    if stoch is None or stoch.empty:
+        return
+    k, d = stoch.iloc[-1, 0], stoch.iloc[-1, 1]
+    macd_s3 = ta.macd(df["close"], fast=5, slow=13, signal=6)
+    if macd_s3 is None or macd_s3.empty:
+        return
+    mh_s3 = macd_s3["MACDh_5_13_6"].iloc[-1]
+    df["rsi7"] = ta.rsi(df["close"], 7)
+    rsi7 = df["rsi7"].iloc[-1]
 
-#     if abs(fl1 - fl2) < curr_price * 0.0002 and pk2 < pk1:
-#         if curr_price < fl2 and sync_bear and df["volume"].iloc[-1] > vol_ma:
-#             trigger_signal(symbol, "S2: TRIANGLE SYNC", "DOWN 🔴", curr_price)
-#             return
+    if k < 20 and k > d and mh_s3 > 0 and rsi7 < 30:
+        schedule_early_alert(symbol, "S3: SYNC SCALP", "UP 🟢", curr_price)
+        return
+    if k > 80 and k < d and mh_s3 < 0 and rsi7 > 70:
+        schedule_early_alert(symbol, "S3: SYNC SCALP", "DOWN 🔴", curr_price)
+        return
 
-#     # ===== S3: STOCH SCALPER =====
-#     stoch = ta.stoch(df["high"], df["low"], df["close"], 5, 3, 3)
-#     if stoch is None or stoch.empty:
-#         return
+    # S4: Trend Rider + MOM
+    sma100 = ta.sma(df["close"], 100)
+    if sma100 is None or sma100.isna().iloc[-1]:
+        return
+    st = ta.supertrend(df["high"], df["low"], df["close"], length=5, multiplier=2)
+    st_dir = st["SUPERTd_5_2"].iloc[-1]
+    mom = ta.mom(df["close"], 10)
+    if mom is None or mom.isna().iloc[-1] or len(mom) < 2:
+        return
+    curr_mom, prev_mom = mom.iloc[-1], mom.iloc[-2]
+    touching = abs(curr_price - sma100.iloc[-1]) / sma100.iloc[-1] < 0.001
+    mom_up = curr_mom > prev_mom and curr_mom > 0
+    mom_down = curr_mom < prev_mom and curr_mom < 0
 
-#     k, d = stoch.iloc[-1, 0], stoch.iloc[-1, 1]
+    if touching and st_dir == 1 and mom_up:
+        schedule_early_alert(symbol, "S4: TREND RIDER + MOM", "UP 🟢", curr_price)
+        return
+    if touching and st_dir == -1 and mom_down:
+        schedule_early_alert(symbol, "S4: TREND RIDER + MOM", "DOWN 🔴", curr_price)
+        return
 
-#     if k < 20 and k > d and sync_bull:
-#         trigger_signal(symbol, "S3: SYNC SCALP", "UP 🟢", curr_price)
-#         return
-#     if k > 80 and k < d and sync_bear:
-#         trigger_signal(symbol, "S3: SYNC SCALP", "DOWN 🔴", curr_price)
-#         return
+# ================== EARLY ALERT SYSTEM ==================
+def schedule_early_alert(symbol, strategy, direction, entry_price):
+    early_alerts[symbol] = {"strategy": strategy, "direction": direction, "entry": entry_price, "timer": time.time()}
+    bot.send_message(CHAT_ID, f"⏱ 7s ALERT: {symbol} | {strategy}")
+    # Start 7-second timer
+    threading.Timer(7, resolve_early_alert, args=[symbol]).start()
 
-#     # ===== S4: TREND RIDER =====
-#     sma100 = ta.sma(df["close"], 100).iloc[-1]
-#     st = ta.supertrend(df["high"], df["low"], df["close"], 5, 2)
-#     st_dir = st.iloc[:, -1].iloc[-1]  # ✅ Safe direction
+def resolve_early_alert(symbol):
+    if symbol not in market_history:
+        return
+    df = market_history[symbol]
+    curr_price = df["close"].iloc[-1]
+    alert = early_alerts.get(symbol)
+    if not alert:
+        return
 
-#     body_now = abs(df["close"].iloc[-1] - df["open"].iloc[-1])
-#     body_prev = abs(df["close"].iloc[-2] - df["open"].iloc[-2])
+    # Check if conditions still valid (simple price check for demonstration)
+    if abs(curr_price - alert["entry"]) / alert["entry"] > 0.05:  # >5% deviation loses signal
+        bot.send_message(CHAT_ID, f"❌ Signal LOST: {symbol} | {alert['strategy']}")
+        logging.info(f"{symbol} | Early alert lost")
+        early_alerts.pop(symbol)
+        return
 
-#     touching = abs(curr_price - sma100) / sma100 < 0.0001
+    # Send actual signal
+    trigger_signal(symbol, alert["strategy"], alert["direction"], alert["entry"])
+    early_alerts.pop(symbol)
 
-#     if touching and body_now > body_prev:
-#         if st_dir == 1 and sync_bull:
-#             trigger_signal(symbol, "S4: TREND RIDER", "UP 🟢", curr_price)
-#         elif st_dir == -1 and sync_bear:
-#             trigger_signal(symbol, "S4: TREND RIDER", "DOWN 🔴", curr_price)
+# ================== SIGNAL & RESULTS ==================
+def trigger_signal(symbol, strategy, direction, entry):
+    last_signal_time[symbol] = time.time()
+    bot.send_message(
+        CHAT_ID,
+        f"🎯 **{strategy}**\n📊 {symbol} | {direction}\n⏱ 1 MIN | Entry: {entry}",
+        parse_mode="Markdown"
+    )
+    logging.info(f"Triggered: {strategy} | {symbol} | {direction} at {entry}")
+    threading.Timer(60, check_result, args=[symbol, entry, direction]).start()
 
-# # ================== SIGNAL & RESULTS ==================
-# def trigger_signal(symbol, strategy, direction, entry):
-#     last_signal_time[symbol] = time.time()
-#     candle_index = len(market_history[symbol]) - 1
+def check_result(symbol, entry_price, direction):
+    df = market_history.get(symbol)
+    if df is None or len(df) < 2:
+        return
+    exit_price = df["close"].iloc[-1]
+    win = exit_price > entry_price if "UP" in direction else exit_price < entry_price
+    stats["total"] += 1
+    stats["wins"] += int(win)
+    stats["losses"] += int(not win)
+    wr = round(stats["wins"] / stats["total"] * 100, 1)
+    bot.send_message(CHAT_ID, f"{'✅ WIN' if win else '❌ LOSS'} | {symbol}\nWR: {wr}%")
+    logging.info(f"{symbol} | Trade result: {'WIN' if win else 'LOSS'} | Exit: {exit_price} | WR: {wr}%")
 
-#     bot.send_message(
-#         CHAT_ID,
-#         f"🎯 **{strategy}**\n📊 {symbol} | {direction}\n⏱ 1 MIN | Entry: {entry}",
-#         parse_mode="Markdown"
-#     )
+# ================== WEBSOCKET ==================
+def on_message(ws, message):
+    if not message.startswith('42["candles"'):
+        return
+    payload = json.loads(message[2:])[1]
+    asset = payload["asset"]
+    df = pd.DataFrame(payload["candles"])
+    df.rename(columns={"o":"open","c":"close","h":"high","l":"low","v":"volume"}, inplace=True)
+    market_history[asset] = df.tail(100)
+    analyze_all_strategies(asset, market_history[asset])
+    logging.info(f"{asset} updated with {len(df)} candles")
 
-#     threading.Timer(60, check_result, args=[symbol, candle_index, direction]).start()
+def connect():
+    ws = websocket.WebSocketApp(
+        "wss://api-c.po.market/socket.io/?EIO=4&transport=websocket",
+        on_message=on_message,
+        header=[f"Cookie: SSID={SSID}"]
+    )
+    logging.info("Connecting to WebSocket...")
+    ws.run_forever(ping_interval=25, ping_timeout=10)
 
-# def check_result(symbol, entry_index, direction):
-#     global stats
-#     df = market_history.get(symbol)
-#     if df is None or len(df) <= entry_index + 1:
-#         return
+# ================== FLASK KEEP-ALIVE ==================
+app = Flask("keep_alive")
+@app.route("/")
+def home():
+    return "Bot is running!"
 
-#     entry = df["close"].iloc[entry_index]
-#     exit_p = df["close"].iloc[entry_index + 1]
-
-#     win = exit_p > entry if "UP" in direction else exit_p < entry
-
-#     stats["total"] += 1
-#     stats["wins"] += int(win)
-#     stats["losses"] += int(not win)
-
-#     wr = round(stats["wins"] / stats["total"] * 100, 1)
-#     bot.send_message(CHAT_ID, f"{'✅ WIN' if win else '❌ LOSS'} | {symbol}\nWR: {wr}%")
-
-# # ================== WEBSOCKET ==================
-# def on_error(ws, error):
-#     if "401" in str(error):
-#         bot.send_message(CHAT_ID, "⚠️ **SSID EXPIRED — UPDATE REQUIRED**")
-
-# def on_message(ws, message):
-#     if not message.startswith('42["candles"'):
-#         return
-#     try:
-#         payload = json.loads(message[2:])[1]
-#         asset = payload["asset"]
-
-#         df = pd.DataFrame(payload["candles"])
-#         df.rename(columns={"o":"open","c":"close","h":"high","l":"low","v":"volume"}, inplace=True)
-
-#         market_history[asset] = df
-#         analyze_all_strategies(asset, df)
-
-#     except Exception as e:
-#         print(f"Processing Error: {e}")
-
-# def connect():
-#     while True:
-#         try:
-#             ws = websocket.WebSocketApp(
-#                 "wss://api-c.po.market/socket.io/?EIO=4&transport=websocket",
-#                 on_message=on_message,
-#                 on_error=on_error,
-#                 header=[f"Cookie: SSID={SSID}"]
-#             )
-#             ws.run_forever(ping_interval=20)
-#         except:
-#             time.sleep(10)
-
-# # ================== START ==================
-# if __name__ == "__main__":
-#     threading.Thread(target=update_news_calendar, daemon=True).start()
-#     bot.send_message(CHAT_ID, "✅ **BOT ONLINE — ALL SYSTEMS STABLE**")
-#     connect()
+# ================== START ==================
+if __name__ == "__main__":
+    threading.Thread(target=update_news_calendar, daemon=True).start()
+    bot.send_message(CHAT_ID, "✅ BOT ONLINE — ALL SYSTEMS STABLE")
+    logging.info("Bot started, all systems stable.")
+    threading.Thread(target=lambda: app.run(host="0.0.0.0", port=10000)).start()
+    connect()
